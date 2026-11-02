@@ -1,0 +1,272 @@
+"""Tests for tp-pr-iterate JSON schemas (v1).
+
+These tests cover schema well-formedness and a few structural invariants
+that the iterate-state / classified-comment schemas must satisfy:
+
+* Both schemas must be valid JSON Schema 2020-12 documents.
+* The iterate-state schema uses ``phase`` (not ``state``) as the
+  enum-bearing field — see design.md Mi3.
+* The iterate-state schema declares ``original_diff_lines`` (integer-typed)
+  and ``last_loop_sha`` (nullable string) — see design-audit C2/C3.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from jsonschema import Draft202012Validator
+
+SCHEMAS_DIR = Path(__file__).resolve().parent.parent / "schemas"
+ITERATE_STATE_PATH = SCHEMAS_DIR / "iterate-state.v1.json"
+CLASSIFIED_COMMENT_PATH = SCHEMAS_DIR / "classified-comment.v1.json"
+NORMALIZED_FINDING_PATH = SCHEMAS_DIR / "normalized-finding.v1.json"
+
+
+def _load(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def test_normalized_finding_schema_valid():
+    """Enh.1: the dual-source normalized-finding schema is a valid 2020-12 doc."""
+    schema = _load(NORMALIZED_FINDING_PATH)
+    Draft202012Validator.check_schema(schema)
+
+
+def test_normalized_finding_roundtrip_copilot():
+    """A normalize_copilot() output validates against the schema."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import review_merge  # noqa: E402
+
+    out = review_merge.normalize_copilot(
+        {"comment_id": 7, "thread_id": "RT_x", "path": "a.py",
+         "line_range": [1, 2], "body": "x", "verdict": "structural"}
+    )
+    Draft202012Validator(_load(NORMALIZED_FINDING_PATH)).validate(out)
+
+
+def test_iterate_state_schema_valid():
+    schema = _load(ITERATE_STATE_PATH)
+    Draft202012Validator.check_schema(schema)
+
+
+def test_classified_comment_schema_valid():
+    schema = _load(CLASSIFIED_COMMENT_PATH)
+    Draft202012Validator.check_schema(schema)
+
+
+def test_iterate_state_uses_phase_not_state_field():
+    """Per design Mi3, the loop's lifecycle field is named ``phase``."""
+    schema = _load(ITERATE_STATE_PATH)
+    props = schema["properties"]
+    assert "phase" in props, "iterate-state must declare a 'phase' property"
+    assert "state" not in props, (
+        "iterate-state must not declare a 'state' property (use 'phase' per Mi3)"
+    )
+
+
+def test_iterate_state_has_original_diff_lines_and_last_loop_sha():
+    """Per design-audit C2/C3, both fields must be declared with the right shape."""
+    schema = _load(ITERATE_STATE_PATH)
+    props = schema["properties"]
+
+    # C2: original_diff_lines must exist and accept integers.
+    assert "original_diff_lines" in props, (
+        "iterate-state must declare 'original_diff_lines' (audit C2)"
+    )
+    odl_type = props["original_diff_lines"].get("type")
+    if isinstance(odl_type, list):
+        assert "integer" in odl_type, (
+            "original_diff_lines must allow integer values (audit C2)"
+        )
+    else:
+        assert odl_type == "integer", (
+            "original_diff_lines must be typed as integer (audit C2)"
+        )
+
+    # C3: last_loop_sha must exist and allow string or null.
+    assert "last_loop_sha" in props, (
+        "iterate-state must declare 'last_loop_sha' (audit C3)"
+    )
+    lls_type = props["last_loop_sha"].get("type")
+    assert isinstance(lls_type, list), (
+        "last_loop_sha must accept null in addition to string (audit C3)"
+    )
+    assert "string" in lls_type and "null" in lls_type, (
+        "last_loop_sha type must include both 'string' and 'null' (audit C3)"
+    )
+
+
+def test_iterate_state_accepts_two_stable_fields():
+    """Enh.1: iterate-state validates with resolved/seen thread ids + termination_reason."""
+    schema = _load(ITERATE_STATE_PATH)
+    instance = {
+        "phase": "awaiting-human-review",
+        "iteration": 3,
+        "max_iterations": 8,
+        "max_wall_clock_sec": 14400,
+        "started_at": "2026-06-03T00:00:00Z",
+        "transitions": [],
+        "resolved_thread_ids": ["RT_1", "RT_2"],
+        "seen_thread_ids": ["RT_1", "RT_2"],
+        "termination_reason": "two-stable",
+    }
+    Draft202012Validator(schema).validate(instance)
+
+
+# ---------- Phase 1: awaiting-copilot phase ----------
+
+
+def test_iterate_state_phase_enum_includes_awaiting_copilot():
+    """Phase 1, Task 1.1: the phase enum must include 'awaiting-copilot'
+    and an instance using that phase must validate against the schema."""
+    schema = _load(ITERATE_STATE_PATH)
+    phase_enum = schema["properties"]["phase"]["enum"]
+    assert "awaiting-copilot" in phase_enum, (
+        "iterate-state.v1.json phase enum must include 'awaiting-copilot'"
+    )
+
+    instance = {
+        "phase": "awaiting-copilot",
+        "iteration": 1,
+        "max_iterations": 8,
+        "max_wall_clock_sec": 14400,
+        "started_at": "2026-06-05T00:00:00Z",
+        "transitions": [],
+    }
+    Draft202012Validator(schema).validate(instance)
+
+
+# ---------- Phase 2 Task 2.1: new state fields + blocked-no-independent-review phase ----------
+
+
+def _base_instance():
+    return {
+        "phase": "awaiting-copilot",
+        "iteration": 1,
+        "max_iterations": 8,
+        "max_wall_clock_sec": 14400,
+        "started_at": "2026-06-05T00:00:00Z",
+        "transitions": [],
+    }
+
+
+def test_iterate_state_accepts_reviewed_head_shas():
+    """reviewed_head_shas (array of strings) is accepted as an optional field."""
+    schema = _load(ITERATE_STATE_PATH)
+    instance = _base_instance()
+    instance["reviewed_head_shas"] = ["abc1234", "def5678"]
+    Draft202012Validator(schema).validate(instance)
+
+
+def test_iterate_state_accepts_last_codereview_findings():
+    """last_codereview_findings (array) is accepted as an optional field."""
+    schema = _load(ITERATE_STATE_PATH)
+    instance = _base_instance()
+    instance["last_codereview_findings"] = [
+        {"file": "a.py", "verdict": "structural", "summary": "bug", "line_range": [1, 2]}
+    ]
+    Draft202012Validator(schema).validate(instance)
+
+
+def test_iterate_state_accepts_empty_last_codereview_findings():
+    """last_codereview_findings = [] (clean review) is accepted."""
+    schema = _load(ITERATE_STATE_PATH)
+    instance = _base_instance()
+    instance["last_codereview_findings"] = []
+    Draft202012Validator(schema).validate(instance)
+
+
+def test_iterate_state_accepts_last_codereview_head_sha_string():
+    """last_codereview_head_sha as a string is accepted."""
+    schema = _load(ITERATE_STATE_PATH)
+    instance = _base_instance()
+    instance["last_codereview_head_sha"] = "abc1234def5678"
+    Draft202012Validator(schema).validate(instance)
+
+
+def test_iterate_state_accepts_last_codereview_head_sha_null():
+    """last_codereview_head_sha as null is accepted."""
+    schema = _load(ITERATE_STATE_PATH)
+    instance = _base_instance()
+    instance["last_codereview_head_sha"] = None
+    Draft202012Validator(schema).validate(instance)
+
+
+def test_iterate_state_phase_enum_includes_blocked_no_independent_review():
+    """The phase enum must include 'blocked-no-independent-review'."""
+    schema = _load(ITERATE_STATE_PATH)
+    phase_enum = schema["properties"]["phase"]["enum"]
+    assert "blocked-no-independent-review" in phase_enum, (
+        "iterate-state.v1.json phase enum must include 'blocked-no-independent-review'"
+    )
+    # validate an instance that uses this phase
+    instance = _base_instance()
+    instance["phase"] = "blocked-no-independent-review"
+    Draft202012Validator(schema).validate(instance)
+
+
+def test_iterate_state_new_fields_are_optional():
+    """New fields are optional — existing state without them must still validate."""
+    schema = _load(ITERATE_STATE_PATH)
+    # Minimal required-only state (no new fields)
+    instance = _base_instance()
+    Draft202012Validator(schema).validate(instance)
+
+
+def test_iterate_state_rejects_unknown_field():
+    """additionalProperties:false must reject an unknown top-level field."""
+    import jsonschema
+    schema = _load(ITERATE_STATE_PATH)
+    instance = _base_instance()
+    instance["totally_unknown_field_xyz"] = "oops"
+    with pytest.raises(jsonschema.ValidationError):
+        Draft202012Validator(schema).validate(instance)
+
+
+def test_normalized_finding_class_fields():
+    """iterate-convergence-budget Task 1.3: class/blocking/reproducer/downgrade/schema_note."""
+    import jsonschema
+    v = Draft202012Validator(_load(NORMALIZED_FINDING_PATH))
+    base = {"source": "code-review", "file": "a.py", "line_range": [1, 2],
+            "summary": "x", "verdict": "minor"}
+    for cls in ("P", "X", "T", "C"):
+        v.validate(dict(base, **{"class": cls, "blocking": False}))
+    v.validate(dict(base, verdict="structural", **{"class": "P"}, blocking=True,
+                    reproducer={"kind": "command", "argv": ["true"], "expect": {"exit": 1}},
+                    downgrade={"reason": "inconclusive", "output": "timeout"},
+                    schema_note="legacy-no-reproducer"))
+    with pytest.raises(jsonschema.ValidationError):
+        v.validate(dict(base, **{"class": "Z"}))
+
+
+def test_iterate_state_budget_fields():
+    """iterate-convergence-budget Task 3.2: budget phase, reasons and fields; no grant field."""
+    import jsonschema
+    schema = _load(ITERATE_STATE_PATH)
+    v = Draft202012Validator(schema)
+    inst = _base_instance()
+    inst.update(phase="budget-exhausted", budget_pr_url="https://github.com/o/r/pull/1",
+                budget_baseline_head="abc",
+                budget_baseline_split={"test_added": 3, "code_added": 9},
+                budget_last_head="def", budget_last_round="r3.1",
+                budget_last_action="fix", budget_head_blocking=True,
+                consecutive_codereview_structural_rounds=2)
+    for reason in ("round-cap", "growth-lines", "test-code-ratio", "budget-error",
+                   "wall-clock", "k-consecutive"):
+        v.validate(dict(inst, termination_reason=reason))
+    nulls = {f: None for f in ("budget_pr_url", "budget_baseline_head",
+                               "budget_baseline_split", "budget_last_head",
+                               "budget_last_round", "budget_last_action",
+                               "budget_head_blocking")}
+    v.validate(dict(_base_instance(), **nulls))
+    for action in ("degraded", "noop"):
+        v.validate(dict(inst, budget_last_action=action))
+    with pytest.raises(jsonschema.ValidationError):
+        v.validate(dict(inst, budget_last_action="grant"))
+    assert not [k for k in schema["properties"] if "grant" in k]

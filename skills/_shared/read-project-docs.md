@@ -1,0 +1,17 @@
+# Read Project Docs
+
+Read the project docs if they exist — do not require them. **Read vision first** so every downstream judgment is framed against the "why":
+
+1. `three-pillars-docs/vision.md` — **the why**. Problem, users, principles, non-goals, success signals. Every recommendation, design, and plan should serve the vision. Flag anything that contradicts it.
+2. `three-pillars-docs/architecture.md` — the how. System structure and key decisions.
+3. `three-pillars-docs/product_roadmap.md` — the what next. Current state, inventory, sequence.
+4. `three-pillars-docs/known_issues.md` — the what's broken (**open issues only**).
+5. `python3 "$TP_ROOT"/skills/_shared/pending_changes.py summary` — designs merged whose fragment is not yet compiled into the docs above; count each listed slug as done (fail-open: no output means none pending).
+
+**Cold files**: read these four live docs only. Never read `*_archive.md`, `known_issues_resolved.md` or `known_issues_low.md` by default. Open one only for a closed issue's history, a lookup on a miss in a live doc, or a writer or ID-resolution reader that must.
+
+Treat `three-pillars-docs/vision.md` as load-bearing context — if a proposed design, plan, or recommendation conflicts with the vision's principles or non-goals, say so explicitly and ask the user whether to proceed, revise the work, or update the vision.
+
+If `three-pillars-docs/vision.md` is missing, suggest running `/tp-setup` (which creates it as its first step). If the other three are missing, suggest `/tp-docs-init`. Do not block in either case — the user may want to proceed without them.
+
+**Spawned-agent complement**: `three-pillars-docs/project-context.md` is a fifth living doc designed for *subagents*, not the main agent. It carries conventions, stack, and domain rules that would otherwise require re-derivation. The loader `skills/_shared/project_context.py` reads it, size-checks it (hard cap: 12,288 bytes), and returns a prompt-ready block injected into council Round 1 members and `tp-phase-implement` workers. Absent doc → empty block (no-op). Do not read this file through the four-doc path above — it is wired separately at dispatch time.

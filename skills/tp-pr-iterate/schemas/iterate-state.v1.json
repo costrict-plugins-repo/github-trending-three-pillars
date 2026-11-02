@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tp-pr-iterate/iterate-state.v1",
+  "title": "tp-pr-iterate loop state (v1)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "phase",
+    "iteration",
+    "max_iterations",
+    "max_wall_clock_sec",
+    "started_at",
+    "transitions"
+  ],
+  "properties": {
+    "phase": {
+      "type": "string",
+      "enum": [
+        "opening-pr",
+        "awaiting-review",
+        "fixing",
+        "awaiting-human-review",
+        "cap-exhausted",
+        "convergence-failure",
+        "errored",
+        "awaiting-copilot",
+        "blocked-no-independent-review",
+        "budget-exhausted"
+      ]
+    },
+    "iteration": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_iterations": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "max_wall_clock_sec": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "last_verdict": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        null,
+        "structural-present",
+        "minor-only",
+        "no-applicable-fixes",
+        "all-conflicting-deferred-to-human"
+      ]
+    },
+    "transitions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "phase",
+          "at"
+        ],
+        "properties": {
+          "phase": {
+            "type": "string"
+          },
+          "at": {
+            "type": "string"
+          },
+          "note": {
+            "type": [
+              "string",
+              "object",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "reproduced_blockers": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "review_weight": {
+      "type": "string",
+      "enum": [
+        "just-do-it",
+        "light",
+        "spike",
+        "full"
+      ]
+    },
+    "frozen_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cumulative_diff_lines": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "original_diff_lines": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "consecutive_structural_rounds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "degraded_review_retries": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "last_loop_sha": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_comment_seen_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resolved_thread_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "seen_thread_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "termination_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        null,
+        "classifier-flip",
+        "two-stable",
+        "idle-timeout",
+        "human-push",
+        "all-conflicting",
+        "round-cap",
+        "growth-lines",
+        "test-code-ratio",
+        "budget-error",
+        "wall-clock",
+        "k-consecutive"
+      ]
+    },
+    "reviewed_head_shas": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "last_codereview_findings": {
+      "type": "array"
+    },
+    "last_codereview_head_sha": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "consecutive_codereview_structural_rounds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "budget_pr_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "budget_baseline_head": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "budget_baseline_split": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "test_added": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "code_added": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "budget_last_head": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "budget_last_round": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "budget_last_action": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        null,
+        "degraded",
+        "fix",
+        "noop"
+      ]
+    },
+    "budget_head_blocking": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "budget_active_elapsed_sec": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "budget_round_started_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "review_stop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "choice",
+        "head",
+        "ruling_id",
+        "iteration"
+      ],
+      "properties": {
+        "choice": {
+          "type": "string",
+          "enum": [
+            "stop",
+            "fix"
+          ]
+        },
+        "head": {
+          "type": "string"
+        },
+        "ruling_id": {
+          "type": "string"
+        },
+        "iteration": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "budget_extensions": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "limit",
+          "key",
+          "at"
+        ],
+        "properties": {
+          "limit": {
+            "type": "number"
+          },
+          "key": {
+            "type": "string"
+          },
+          "at": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

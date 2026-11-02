@@ -1,0 +1,262 @@
+---
+name: tp-promote
+description: Promote a seed (seed.md) to a committed, floor-clearing design.md on the tp/{slug} branch, then launches its design run. Reads the seed's Open questions, derives a single batched confirm block, collects one operator answer, drafts design.md, validates the floor, and launches /tp-run-full-design {slug} --skip-design (Mode B) in the shared design-run launcher's own tmux session, linked into this one.
+argument-hint: "{slug} [--force-takeover]"
+effort: high
+---
+
+# /tp-promote \<slug\>
+
+Turn a rich `seed.md` into a committed, floor-clearing `design.md` on the
+`tp/<slug>` branch — the cold-start pre-step before its design run.
+Exactly **one human touch**: a single batched confirm block derived from the
+seed's `## Open questions`. After the operator answers, this skill drafts
+`design.md`, validates the floor, commits, and launches
+`/tp-run-full-design <slug> --skip-design` as its own top-level session in the launcher's own
+tmux session `<slug>`, linked into this one (`skills/_shared/design-run-launch.md`) — never in this session.
+
+**No `--auto` mode** — the one batched confirm is the deliberate human gate.
+
+## Arguments
+
+- `{slug}` (required) — kebab-case design name matching `[a-z0-9-]+`, validated
+  per `skills/_shared/validate-name.md`. Must match an existing directory under
+  `three-pillars-docs/tp-designs/{slug}/` that contains a `seed.md`.
+- `--force-takeover` (optional) — claim the lock even when another developer
+  holds it. The prior holder is recorded in `previous_owners[]`.
+
+## Steps
+
+1. **Run first-run preflight** per `skills/_shared/first-run.md`.
+
+2. **Validate `<slug>`** per `skills/_shared/validate-name.md`. Reject any
+   value containing `/`, `..`, spaces, or characters outside `[a-z0-9-]`.
+   After validation, track the design in `.claude/last-design` (MRU update).
+
+3. **Collaboration preflight** per `skills/_shared/collaboration.md`:
+   - If on `master`/`main`, offer to create/switch to `tp/<slug>`.
+   - Read `three-pillars-docs/tp-designs/<slug>/lock.json`. If `owner` is
+     another developer and `--force-takeover` was NOT passed, refuse and
+     surface the holder. If `--force-takeover` was passed, record the prior
+     owner in `previous_owners[]` and claim the lock. Set `phase: "promote"`.
+   - Write `lock.json` back to disk (do NOT commit yet — lock commits with
+     `design.md` in Step 8).
+
+4. **Require `seed.md`**: check that
+   `three-pillars-docs/tp-designs/<slug>/seed.md` exists and is non-empty.
+   If absent, stop:
+   > `seed.md` not found for `<slug>`. Author
+   > `three-pillars-docs/tp-designs/<slug>/seed.md` (a rich seed with a
+   > `## Open questions` section) before promoting.
+
+4b. **Settle the weight class, lean**: parse `seed.md`'s leading
+   frontmatter block for `weight-class` and the four axis keys (protocol:
+   `skills/_shared/weight-class.md`). A seed class is a default, not a floor:
+   run `python3 "$TP_ROOT"/skills/_shared/weight_class.py lighten three-pillars-docs/tp-designs/<slug> --risk … --blast-radius … --reversibility … --novelty …`
+   even when the seed carries a class. A seed without the four axis keys is
+   scored here (risk, blast radius, reversibility, novelty from the seed's
+   `## Problem` and `## Sketch`, passed as the flags). It prints `keep {class}`
+   or `suggest {class} because {axis}`. Run
+   `python3 "$TP_ROOT"/skills/_shared/weight_class.py cost` and fold **one**
+   class question into Step 5's batched confirm that shows the cost beside
+   each class and offers the class `lighten` printed as the default answer
+   (`weight_class.py recommend` output when `lighten` has no suggestion), for
+   the operator to accept or override. Stamp the settled class (the
+   suggestion, the kept class or the operator's override) onto `seed.md` too
+   via `write_class` (a function of `python3 "$TP_ROOT"/skills/_shared/weight_class.py`)
+   when the seed lacks a class or carries a different one, before Step 7
+   writes `design.md`.
+
+5. **Derive the batched confirm**: parse `seed.md` for `## Open questions` (and
+   any explicit judgment calls in `## Sketch` or `## Problem`) as *inputs* to
+   the map below, not as the questions themselves. Each numbered confirm line is
+   a map-derived question; a seed question no answer can flip becomes a default.
+   Where the seed already states a preference or answer, present the drafter's
+   inferred default so the operator can accept it wholesale. Include the Step 4b weight-class question. Produce a single numbered prompt block — the entire
+   set of questions at once, not one at a time.
+
+   **Derive it from the state-space map** (above just-do-it): build the map per
+   the Build mode of `skills/_shared/state-space-protocol.md` first — flip test,
+   goal/locus questions first, one plain-language problem paragraph per
+   question. The HTML briefing (step 6) renders the same question format.
+   If Step 4b's class is still unanswered, build against its printed
+   default (`lighten`, else `recommend`) and re-trim at step 7.
+
+   Example layout (adapt to the actual questions):
+   ```
+   Batched confirm for <slug>:
+
+   1. [<dimension> — flips: a · default: a] <problem paragraph> Options: a … · b …
+   2. [<locus/dimension> — no clear default] <problem paragraph> Your answer:
+   Defaults (no flip): <dimension> = <option>; …
+   ...
+   ```
+
+6. **Present the whole block at once and STOP** (one human touch / single
+   batched confirm). Wait for the operator's answers before proceeding. Do NOT
+   ask individual follow-up questions — collect the full block in one round. The block, prose or card, carries a line `seat-allow: promote-confirm` of its own.
+
+   **HTML briefing (when a display is available):** the confirm block is
+   rendered as a self-contained HTML page (no CDN / no external resources)
+   and opened via `xdg-open`. The page's "Assemble answers" button produces
+   a compact answer string for the operator to paste back.
+
+   **Canonical compact paste grammar** (HTML page output and terminal fallback
+   both accept this format):
+
+   - `defaults` — accept every drafter default with no changes.
+   - Otherwise, one override per line (**newline-separated, never comma**);
+     unmentioned questions keep their default:
+     - Single-select: `2b` — question 2, option b.
+     - Multi-select: `4a c` — question 4, options a and c (space-separated
+       letters within the question).
+     - Free-text: `3: my answer, commas are fine` — question 3; everything
+       after the `: ` to end-of-line is the answer (commas in the body are safe
+       because questions are newline-delimited, not comma-delimited).
+   - Example mixed override (two questions overridden):
+     ```
+     3: use the blue variant, it's faster
+     5b
+     ```
+
+   **Headless / SSH fallback:** when `DISPLAY` is not set or `xdg-open` is
+   absent, the HTML file is still written beside `decisions.md` (auditable
+   artifact) and the path is printed; the operator answers the terminal
+   confirm using the same grammar above.
+
+7. **Draft `design.md`** from `seed.md` + operator answers. Stamp the Step 4b
+   class and the floor as the file's leading frontmatter block
+   (`weight-class: <class>` and `floor: 3`) — the seed-time declaration carries
+   to the promoted design. The `floor: 3` stamp makes
+   `## Consumer-repo behaviour` a required section (per
+   `skills/_shared/consumer-repo-rule.md`), and `## Forge behaviour` too when
+   the design names a forge surface and its class is above just-do-it. Whenever the settled
+   class is `just-do-it`, also stamp `estimated-lines: <n>` there: copy the seed's
+   `estimated-lines` when it carries one, else estimate the rough lines the change adds, as
+   `/tp-design` step 7 does (a light-by-default or retro-filed seed has no value, and without
+   it `inline_fit` prices each task at 50 lines). Populate every section that
+   `validate_design_floor.py` marks REQUIRED:
+   - `## Problem` — what the design solves (from seed `## Problem` + answers)
+   - `## Vision alignment` — how it fits the project vision
+   - `## Scope` with `### In scope` (non-empty bullet list)
+   - `## Behaviors` — concrete observable behaviors
+   - `## Constraints` — hard limits and non-goals
+   - `## Consumer-repo behaviour` — what ships to a user's repo and what runs
+     there, and the behaviour when an optional piece (tmux, a bot account, the
+     local router, a non-pytest runner) is absent
+   Optional but recommended: `## Dependencies`, `## Entities`, `## Open Questions`.
+   Required above just-do-it (not floor-validated): `## State space` — the step-5
+   map re-trimmed to the answered class, persisted per the protocol.
+
+   The drafted `design.md` must be substantive enough to pass the floor.
+   **Do NOT commit a thin stub** — if you cannot draft a passing design from
+   the seed + answers, surface the gaps and ask the operator to flesh them out
+   before proceeding.
+
+8. **Validate the floor**: run:
+   ```
+   python3 "$TP_ROOT"/skills/_shared/validate_design_floor.py three-pillars-docs/tp-designs/<slug>
+   ```
+   - **Exit 0 (PASS)**: run the advisory, warn-only lint
+     `python3 "$TP_ROOT"/skills/_shared/state_space_lint.py three-pillars-docs/tp-designs/<slug>`
+     — show any `WARN` lines to the operator and log them in step 9; they
+     never block. Then proceed to commit.
+   - **Exit 1 (BLOCKED)**: surface the JSON verdict on stderr, do NOT commit.
+     Tell the operator which sections are missing/empty and ask them to fill
+     the named sections. Only retry after the operator updates `design.md`.
+   - Any other exit or failure to launch → BLOCKED with Cause: floor-validator-crash, Details: captured stderr (truncated to 500 chars). Never treat a non-0/1 exit as PASS.
+
+9. **Log to `decisions.md`** (append, using the `[tp-promote]` prefix per
+   `skills/_shared/auto-mode.md` decisions.md format):
+   ```markdown
+   ### [tp-promote] <slug> — batched confirm + answers
+
+   **Prompt presented:**
+   <paste the numbered confirm block from Step 6>
+
+   **Operator answers:**
+   <paste the operator's answers verbatim>
+
+   **Floor validation:** PASS (exit 0)
+   **State-space lint:** <WARN lines from step 8, or "clean">
+   ```
+
+10. **Commit** on `tp/<slug>` (or the current branch if already on it):
+    Stage only:
+    - `three-pillars-docs/tp-designs/<slug>/design.md`
+    - `three-pillars-docs/tp-designs/<slug>/lock.json`
+    - `three-pillars-docs/tp-designs/<slug>/decisions.md`
+
+    Commit message: `Design: <slug> high-level`
+
+    (This message is byte-compatible with what `/tp-design` would produce, so
+    downstream tools — `fleet-precheck-designready`'s `design-only` verdict and
+    Mode B's design-floor gate — treat a promoted design identically to a
+    hand-authored one.)
+
+11. **Launch the design run in its own window** per
+    `skills/_shared/design-run-launch.md`. Never invoke `/tp-run-full-design` here
+    via the Skill tool or the Agent tool — run the launcher:
+
+    ```bash
+    python3 "$TP_ROOT"/skills/_shared/launch_design_run.py <slug> --skip-design
+    ```
+
+    - **Exit 0**: the launcher registers the run on the fleet roster (a `roster: … not
+      registered` line means it did not); report the printed window target (the run has its own tmux session,
+      linked into this one). The run is Mode B — it skips the design step. This session is done.
+    - **Exit 2, "already live"** (a run is going in session `<slug>`): relay the printed
+      attach line (`tmux attach -t <slug>`) — there is no manual command; never start a second run.
+    - **Exit 2** (no tmux, no worktree, …): relay the printed manual command to
+      the operator verbatim as the fallback — it has the form
+      `TP_DESIGN_RUN=1 claude --model 'sonnet[1m]' '/tp-run-full-design <slug> --skip-design'`
+      run from the worktree — and stop. Do not start the run in this session.
+
+    - A `just-do-it` seed promotes to a floor-passing mini design (no
+      `## State space` section) and launches with this same `--skip-design`
+      command; Tier 1 then routes it via `jdi_eligibility.py route` —
+      `python3 "$TP_ROOT"/skills/_shared/jdi_eligibility.py route --design-dir three-pillars-docs/tp-designs/{slug} --base origin/<base> --head HEAD`.
+
+    Only when the launch failed (exit 2, no run live) may the slug instead be staged as
+    `design-ready` in a fleet batch; a launched run is never staged again.
+
+## Edge cases
+
+- **Missing `seed.md`** (Step 4): stop with the message above. Do not create a
+  placeholder — a thin seed produces a thin design that will fail the floor.
+
+- **Floor not cleared after draft** (Step 8 exit 1): surface the blocked
+  sections. Ask the operator to flesh them out rather than commit a stub.
+  Retry validation after the operator updates the file. If the floor cannot be
+  cleared from the seed + answers, the seed may need enrichment first.
+
+- **Lock held by another** (Step 3): refuse unless `--force-takeover` is
+  passed. Record the prior holder in `previous_owners[]`. Never silently steal
+  a lock.
+
+- **`design.md` already exists**: warn the operator:
+  > `design.md` already exists for `<slug>`. Promote is for the cold-start
+  > case. Options:
+  > - **Revise**: replace the existing `design.md` by continuing (you will
+  >   draft over it).
+  > - **Abort**: stop here; if the design is already acceptable, launch it with
+  >   the design-run launcher exactly as in Step 11.
+  Wait for an explicit operator choice before proceeding.
+
+## Rules
+
+- **Validate `<slug>`** per `skills/_shared/validate-name.md` (the `[a-z0-9-]+`
+  pattern) — all paths interpolate this value.
+- **One human touch**: the single batched confirm (Step 6) is the only
+  interactive stop. Do not add follow-up confirmation rounds.
+- **No `--auto`**: this skill has no autonomous mode. The human confirm is the
+  intentional gate.
+- **Floor-validate before committing**: never commit a `design.md` that fails
+  `validate_design_floor.py` — surface the verdict and ask the operator to fix.
+- **Commit scope**: only `design.md`, `lock.json`, and `decisions.md`. Do not
+  stage other files.
+- **Commit message**: always `Design: <slug> high-level` (exact form, for
+  downstream compatibility).
+- **Log every decision** to `decisions.md` per `skills/_shared/auto-mode.md`
+  format (even though this is not an `--auto` skill — the decisions.md format
+  is the canonical log).

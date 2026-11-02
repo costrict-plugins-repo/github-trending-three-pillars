@@ -1,0 +1,480 @@
+"""converge.py — the convergence-ONLY Tier-7 "reviewed-stable" finish primitive.
+
+Invoked when a `/tp-pr-iterate` / `/tp-run-full-design` Tier-7 round is already
+**structurally clean**, to finalize the two-stable `[code-review-only]` state in a
+single load-bearing, order-sensitive call. It **composes** the existing primitives
+(no forks) and shells the existing `run_round.py`:
+
+    read angle files → merge_codereview_angles  (B1 guard: refuse non-clean rounds)
+    → review_proof.capture_proof
+    → review_proof.format_proof_digest
+    → proof_post.post_proof_checked          (posts as the bot, reads the author back;
+                                              the LAST head-binding action)
+    → seed the UNTRACKED iterate-state.v1.json (last_verdict="minor-only")
+    → shell run_round.py (paths str()-ed, decisions_path OMITTED, config explicit)
+    → convergence_proof.non_degraded_proof_on_head  (independent PASS oracle)
+    → emit terminal JSON; HEAD invariant across the whole call.
+
+Composition-only: NO second implementation of the digest format, the head-bound
+predicate, or the round decision. `review_proof.py` (at the 500-line cap) gets zero
+additions. Stdlib + local scripts only (C1-clean; no anthropic, no claude subprocess).
+Every external interaction is behind an injectable seam so the unit tests run with no
+live `gh` and no network. The CLI `main()` lives in the sibling `converge_cli.py`.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+_SHARED = SCRIPTS_DIR.parent.parent / "_shared"
+if str(_SHARED) not in sys.path:
+    sys.path.insert(0, str(_SHARED))
+
+import iterate_state  # noqa: E402
+import proof_post  # noqa: E402
+import review_merge  # noqa: E402
+import review_proof  # noqa: E402
+import round_budget  # noqa: E402
+import severity  # noqa: E402
+import closeout_gate  # noqa: E402
+import convergence_proof  # noqa: E402 — skills/_shared, on path via the shim above
+import changed_tests_runs  # noqa: E402 — skills/_shared, on path via the shim above
+
+RUN_ROUND_PY = SCRIPTS_DIR / "run_round.py"
+
+
+# ---------- digest label-counts (trap c) ----------
+
+
+def parse_label_counts(args: "list[str] | None") -> "list[tuple[str, int]]":
+    """Parse `--label-count L:N` args into a `list[tuple[str, int]]`.
+
+    Trap (c): `review_proof.format_proof_digest(meta, angle_finding_counts)` takes
+    a **list of `(label, count)` tuples**, NOT a dict — passing a dict would make
+    the digest's `for label, count in ...` unpack the dict keys. Each arg is
+    `LABEL:COUNT`; the LAST colon separates the int count (labels never contain a
+    colon here, but rpartition is robust if one did). A malformed arg (no colon,
+    empty label, or non-int count) raises `ValueError` with a clear message.
+    """
+    out: "list[tuple[str, int]]" = []
+    for raw in args or []:
+        if ":" not in raw:
+            raise ValueError(f"--label-count must be LABEL:COUNT, got {raw!r}")
+        label, _, count_str = raw.rpartition(":")
+        label = label.strip()
+        if not label:
+            raise ValueError(f"--label-count LABEL must be non-empty, got {raw!r}")
+        try:
+            count = int(count_str.strip())
+        except ValueError:
+            raise ValueError(
+                f"--label-count COUNT must be an integer, got {count_str!r} in {raw!r}"
+            )
+        out.append((label, count))
+    return out
+
+
+def label_counts_to_json(counts: "list[tuple[str, int]]") -> "list[list]":
+    """Serialize label-counts for a JSON boundary (state file / logged verdict).
+
+    Tuples do not survive a JSON round-trip (they become lists), so cross-boundary
+    counts are stored as `[[label, count], …]` and reconstructed as tuples on read.
+    """
+    return [[label, count] for label, count in (counts or [])]
+
+
+def label_counts_from_json(data) -> "list[tuple[str, int]]":
+    """Reconstruct label-counts as a `list[tuple[str, int]]` from JSON-decoded data.
+
+    Accepts the list-of-pairs form (`[[label, count], …]`) written by
+    `label_counts_to_json`, OR a plain dict of `{label: count}` — both normalize to
+    a list of tuples so the result is never passed to `format_proof_digest` as a
+    dict (trap c). `None` / empty → `[]`.
+    """
+    if not data:
+        return []
+    if isinstance(data, dict):
+        return [(str(label), int(count)) for label, count in data.items()]
+    out: "list[tuple[str, int]]" = []
+    for pair in data:
+        label, count = pair
+        out.append((str(label), int(count)))
+    return out
+
+
+# ---------- run_round stdin payload (trap b) ----------
+
+
+def build_run_round_stdin(
+    state_path,
+    head_sha,
+    codereview_findings,
+    review_proof_root,
+    review_base,
+    config,
+    pr_url,
+    round=None,  # noqa: A002 — the payload key; with ordinal, the budget's round identity
+    ordinal=None,
+) -> dict:
+    """Build the JSON-serializable stdin object for `run_round.py`.
+
+    Trap (b): `review_proof_root` (from `default_proof_root()`, a `PosixPath`) and
+    `state_path` are `str()`-converted so `json.dumps(payload)` never raises
+    ``TypeError: Object of type PosixPath is not JSON serializable`` (hit live).
+
+    Trap (d) shape: `unresolved_actionable=0`, `ci_rollup=[]`, `reviewed=None`
+    (null is OK on `expects_copilot=false`), and `decisions_path` is **omitted**
+    entirely (its readiness write dirties the tree / risks moving HEAD).
+    `codereview_findings` is the REAL `merge_codereview_angles(...)` result (`[]`
+    on a clean round) — never the `merge_codereview_angles([])` NO-ANGLES sentinel.
+    """
+    return {
+        "state_path": str(state_path),
+        "head_sha": head_sha,
+        "codereview_findings": codereview_findings,
+        "reviewed": None,
+        "unresolved_actionable": 0,
+        "ci_rollup": [],
+        "config": config,
+        "review_proof_root": str(review_proof_root),
+        "review_base": review_base,
+        "pr_url": pr_url, "round": round, "ordinal": ordinal,
+    }
+
+
+# ---------- angle files + convergence-only guard (B1, B5) ----------
+
+
+def _read_angle_texts(angle_files) -> "list[str]":
+    """Read each `--angle-file` path's raw text (files, never a shell heredoc —
+    trap d: command substitution would execute backticks → sentinel findings)."""
+    texts: "list[str]" = []
+    for p in angle_files or []:
+        texts.append(Path(p).read_text(encoding="utf-8"))
+    return texts
+
+
+def _blocks(f: dict) -> bool:
+    """`severity.is_blocking` for a tagged finding; an untagged (legacy) finding keeps
+    its fail-closed `verdict` default — a MISSING tag must never read as "not blocking"."""
+    if "blocking" not in f:
+        return f.get("verdict") == "structural"
+    return severity.is_blocking(f)
+
+
+def guard_refusal(findings: "list[dict]") -> "str | None":
+    """Return a refusal diagnostic when a round is NOT structurally clean, else None.
+
+    B1 / B5: `converge.py` is the *finish*, not the fix loop. It proceeds ONLY on a
+    genuinely clean round (`merge_codereview_angles(...) == []`). Any non-empty
+    result refuses:
+      - degraded sentinels (`no-angles` / unparseable) → never a false convergence;
+      - real blocking findings → point at the fix loop (`run_round.py` / `/tp-pr-fix`).
+
+    Sentinels are checked FIRST: `severity.is_blocking` excludes a sentinel, so a
+    severity filter run first would return None on a degraded review and converge on it
+    (the L125/M27 class of hole, reached from the severity side).
+    """
+    real = [f for f in findings if not review_merge._is_sentinel(f)]
+    blocking = [f for f in real if _blocks(f)]
+    if len(real) < len(findings) and not blocking:  # sentinel-only, or sentinel + notes
+        return (
+            "converge.py refuses: the review is DEGRADED (no angles ran, or an angle "
+            "failed to parse) — this is NOT a clean round. Re-run the review fan-out on "
+            "this head and write real angle replies to the --angle-file paths, then "
+            "converge; never converge on an unparseable/no-angles review."
+        )
+    if not blocking:
+        return None  # non-blocking notes never refuse the finish
+    return (
+        f"converge.py refuses: {len(blocking)} structural finding(s) present — this is a "
+        "FIX round, not a finish. Run the fix loop (run_round.py / /tp-pr-fix) until the "
+        "round is structurally clean, then re-run converge.py."
+    )
+
+
+# ---------- helpers ----------
+
+
+def _emit(out, obj: dict) -> None:
+    out.write(json.dumps(obj) + "\n")
+
+
+def _diag(err, msg: str) -> None:
+    err.write(msg + "\n")
+
+
+def emit_head_refusal(doc: dict, out, err) -> int:
+    line = json.dumps(doc)
+    err.write(line + "\n")
+    out.write(line + "\n")
+    return _EXIT_BLOCKED
+
+
+def _git_head(run_git) -> "str | None":
+    """`git rev-parse HEAD` via the injectable git seam; None on any failure."""
+    rc, stdout, _stderr = (run_git or review_proof._default_run_git)(
+        ["git", "rev-parse", "HEAD"]
+    )
+    if rc != 0:
+        return None
+    return stdout.strip() or None
+
+
+# ---------- ordered convergence orchestration (B2, B6, B7) ----------
+
+# Exit codes: 0 converged · 2 guard-refusal (not a clean round) · 3 fail-closed
+# (degraded capture / post failure / non-PASS oracle / run_round not converged /
+# HEAD moved). Any non-zero leaves the working tree clean (untracked artifacts only).
+_EXIT_CONVERGED = 0
+_EXIT_REFUSED = 2
+_EXIT_BLOCKED = 3
+
+
+def converge(
+    *,
+    base,
+    head,
+    pr_url,
+    config,
+    angle_files,
+    label_counts=None,
+    state_path=None,
+    review_base=None,
+    proof_root=None,
+    post_fn=None,
+    comments_fn=None,
+    self_login_fn=None,
+    run_git=None,
+    run_round_fn=None,
+    derive_base_ref_fn=None,
+    repo_root=None,
+    now_iso=None,
+    out=None,
+    err=None,
+    runs_record_fn=None,
+    ready_ping_fn=None,
+) -> int:
+    """Finalize a structurally-clean round to two-stable `[code-review-only]`.
+
+    See the module docstring for the load-bearing ordered seam. Returns an exit
+    code; emits the terminal JSON on `out` (stdout) and diagnostics on `err`
+    (stderr). HEAD is invariant across the whole call. Every external interaction
+    is behind an injected seam so the unit tests run hermetically.
+    """
+    out = out if out is not None else sys.stdout
+    err = err if err is not None else sys.stderr
+
+    # 1. Read angle files → merge findings.
+    texts = _read_angle_texts(angle_files)
+    findings = review_merge.merge_codereview_angles(texts)
+
+    # 2. Convergence-only guard (B1, B5): refuse non-clean / empty-angle rounds.
+    refusal = guard_refusal(findings)
+    if refusal is not None:
+        _diag(err, refusal)
+        return _EXIT_REFUSED
+
+    gate = closeout_gate.head_refusal(run_git=run_git, repo_root=repo_root)
+    if gate is not None:  # un-archived design head: no digest, no ready label
+        return emit_head_refusal(gate, out, err)
+
+    return _finish_clean(
+        base=base, head=head, pr_url=pr_url, config=config, texts=texts,
+        findings=findings, label_counts=label_counts, state_path=state_path,
+        review_base=review_base, proof_root=proof_root, post_fn=post_fn,
+        comments_fn=comments_fn, self_login_fn=self_login_fn, run_git=run_git,
+        run_round_fn=run_round_fn, derive_base_ref_fn=derive_base_ref_fn,
+        repo_root=repo_root, now_iso=now_iso, out=out, err=err,
+        runs_record_fn=runs_record_fn, ready_ping_fn=ready_ping_fn,
+    )
+
+
+def _seed_state(state_path: Path, head: str, *, now_iso=None) -> None:
+    """Write the UNTRACKED iterate-state.v1.json used by the shelled run_round.py.
+
+    Two-sided: always primes `last_verdict="minor-only"`, `last_codereview_head_sha=head`,
+    empty findings and `phase`; from an existing state it preserves only `iteration`,
+    `started_at`, `original_diff_lines`, the k-counter, `review_weight`, `frozen_at`,
+    `reproduced_blockers` and `budget_*`, and a budget terminal phase (tick re-evaluates
+    it). The three Phase-5 keys are not optional bookkeeping: dropping `frozen_at` here
+    loses the clean-round freeze mark `round_tail` wrote, so the frozen-round partition
+    would never fire in a real loop. Absent → `iteration=0`, no baseline. Written
+    via ``iterate_state.write_state_atomic``: a short file is a run_round.py wedge.
+    """
+    try:
+        prior = json.loads(Path(state_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        prior = None  # absent or unreadable: seed fresh, as before
+    prior = prior if isinstance(prior, dict) else {}
+    now = now_iso or datetime.now(tz=timezone.utc).isoformat()
+    state = {
+        "phase": "awaiting-copilot",
+        "iteration": 0,
+        "max_iterations": 8,
+        "max_wall_clock_sec": 14400,
+        "started_at": now,
+        "transitions": [],
+        "cumulative_diff_lines": 0,
+        "original_diff_lines": None,
+        "consecutive_structural_rounds": 0,
+        "last_loop_sha": None,
+        "last_comment_seen_at": None,
+        "last_verdict": "minor-only",
+        "last_codereview_head_sha": head,
+        "last_codereview_findings": [],
+    }
+    # "frozen_at" is round_freeze.FROZEN_FIELD — literal here to keep the seed's
+    # import graph free of the forge path round_freeze pulls in.
+    keep = ("iteration", "started_at", "original_diff_lines", round_budget.K_KEY,
+            "review_weight", "frozen_at", "reproduced_blockers", "review_stop")
+    state.update({k: v for k, v in prior.items() if k in keep or k.startswith("budget_")})
+    if round_budget.is_budget_terminal(prior):
+        state.update(phase=prior["phase"], termination_reason=prior["termination_reason"])
+    iterate_state.write_state_atomic(state_path, state)
+
+
+def _default_run_round(stdin: dict) -> dict:
+    """Shell the real run_round.py, JSON on stdin → parsed envelope on stdout."""
+    proc = subprocess.run(  # noqa: S603 — fixed argv, no shell
+        [sys.executable, str(RUN_ROUND_PY)],
+        input=json.dumps(stdin).encode(),
+        capture_output=True,
+    )
+    try:
+        return json.loads(proc.stdout.decode().strip())
+    except Exception:
+        return {
+            "converged": False, "terminal": None,
+            "_stdout": proc.stdout.decode(errors="replace"),
+            "_stderr": proc.stderr.decode(errors="replace"),
+        }
+
+
+def _blocked_reason(rr_converged, proof_pass, head_stable, envelope) -> str:
+    if not head_stable:
+        return "HEAD moved during convergence (a commit landed after the proof comment)"
+    if not proof_pass:
+        return ("no non-degraded trusted proof digest on head "
+                "(pred_review_proof_on_head != PASS)")
+    if not rr_converged:
+        if envelope.get("event_token") == "wrapper-aborted":
+            # An operator abort (Ctrl-C / SystemExit) is NOT a review verdict. Without
+            # this branch it rendered as "did not reach two-stable", which reads as a
+            # judgement about the PR rather than about the run being interrupted.
+            return "run_round was ABORTED before it reported a verdict (wrapper-aborted)"
+        detail = (envelope.get("not_converged_reason")
+                  or envelope.get("terminal") or "run_round did not converge")
+        return f"run_round did not reach two-stable ({detail})"
+    return "unknown"
+
+
+def _finish_clean(
+    *, base, head, pr_url, config, texts, findings, label_counts, state_path,
+    review_base, proof_root, post_fn, comments_fn, self_login_fn, run_git,
+    run_round_fn, derive_base_ref_fn, repo_root, now_iso, out, err,
+    runs_record_fn=None, ready_ping_fn=None,
+) -> int:
+    """The clean-round finish: capture → digest → post → seed → run_round → oracle
+    → terminal JSON. Post is the LAST head-binding action; HEAD is invariant."""
+    review_base = review_base or base
+    proof_root = Path(proof_root) if proof_root is not None else review_proof.default_proof_root()
+    state_path = (
+        Path(state_path) if state_path is not None
+        else proof_root / "iterate-state.v1.json"
+    )
+
+    head_before = _git_head(run_git)
+
+    # 3. capture_proof — the untracked per-head artifact (numstat + transcripts + meta).
+    meta = review_proof.capture_proof(
+        base, head, texts, root=proof_root, run_git=run_git, now_iso=now_iso)
+
+    # 4. digest — full head SHA; label-counts as a list of tuples.
+    digest = review_proof.format_proof_digest(meta, label_counts)
+
+    # B7: a degraded capture (empty/failed diff, no-review-angles) fails closed —
+    # NO post, no false converged, tree clean (the artifact is untracked).
+    if meta.get("degraded"):
+        _diag(err, f"converge.py blocked: degraded proof capture ({meta.get('reason')}).")
+        _emit(out, {"converged": False, "terminal": None, "head_sha": head,
+                    "proof_verified": False, "reason": "degraded-capture",
+                    "digest": digest})
+        return _EXIT_BLOCKED
+
+    # 5. Post the proof comment BEFORE run_round — the LAST head-binding action. It posts as
+    # the configured automation account and reads its author back against the gate's trust set.
+    posted = proof_post.post_proof_checked(
+        pr_url, findings, head=head, digest=digest, config=config, post_fn=post_fn,
+        comments_fn=comments_fn, self_login_fn=self_login_fn)
+    if posted["status"] != "ok":
+        _diag(err, f"converge.py blocked: proof-comment {posted['status']}.")
+        blocked = {"converged": False, "terminal": None, "head_sha": head,
+                   "proof_verified": False, "reason": posted["status"]}
+        if posted.get("author"):
+            blocked["author"] = posted["author"]
+        _emit(out, blocked)
+        return _EXIT_BLOCKED
+
+    # 6. Seed/update the UNTRACKED iterate-state.v1.json.
+    _seed_state(state_path, head, now_iso=now_iso)
+
+    # 7. Shell run_round.py (paths str()-ed, decisions_path OMITTED, config explicit).
+    stdin = build_run_round_stdin(
+        state_path=state_path, head_sha=head, codereview_findings=findings,
+        review_proof_root=proof_root, review_base=review_base, config=config,
+        pr_url=pr_url)
+    envelope = (run_round_fn or _default_run_round)(stdin)
+    rr_converged = (bool(envelope.get("converged"))
+                    and "two-stable" in str(envelope.get("terminal") or ""))
+
+    # 8. Independent oracle — the SAME predicate the merge gate reads.
+    proof_pass = convergence_proof.non_degraded_proof_on_head(
+        pr_url, head, config=config, comments_fn=comments_fn,
+        self_login_fn=self_login_fn, run_git=run_git,
+        derive_base_ref_fn=derive_base_ref_fn, repo_root=repo_root)
+
+    head_after = _git_head(run_git)
+    head_stable = head_before == head_after
+
+    if not (rr_converged and proof_pass and head_stable):
+        reason = _blocked_reason(rr_converged, proof_pass, head_stable, envelope)
+        _diag(err, f"converge.py blocked: {reason}.")
+        blocked = {"converged": False, "terminal": envelope.get("terminal"),
+                   "head_sha": head, "proof_verified": bool(proof_pass), "reason": reason}
+        if envelope.get("finalizer_stop") is not None:  # newly fired budget terminal
+            blocked["finalizer_stop"] = envelope["finalizer_stop"]
+        _emit(out, blocked)
+        return _EXIT_BLOCKED
+
+    # 9. Fail-open changed-tests run record for this converged head (Task 9.4): an
+    # unresolvable / unwritable record is logged to err and never changes the verdict.
+    # The PR base (review_base), not `base`: a delta round's `base` is the prior head.
+    try:
+        (runs_record_fn or changed_tests_runs.record)(repo_root or ".", review_base, head)
+    except Exception as exc:  # noqa: BLE001 — fail-open, never blocks convergence
+        _diag(err, f"converge.py: changed_tests_runs.record failed: {exc}")
+
+    # 10. Terminal verdict — byproduct-only, proof-verified. HEAD unchanged throughout.
+    terminal = envelope.get("terminal") or "two-stable [code-review-only]"
+    doc = {"converged": True, "terminal": terminal, "head_sha": head,
+           "proof_verified": True}
+    if ready_ping_fn is not None:  # ready-ping (pr-ready-ping 1.3): fail-open —
+        try:                       # a ping never changes the converged verdict
+            doc["ready_ping"] = ready_ping_fn(pr_url, head)
+        except Exception as exc:  # noqa: BLE001
+            _diag(err, f"converge.py: ready_ping failed: {exc}")
+    _emit(out, doc)
+    return _EXIT_CONVERGED
+
+
+if __name__ == "__main__":
+    from converge_cli import main  # arg-parse lives in the sibling CLI module
+
+    sys.exit(main())

@@ -1,0 +1,205 @@
+"""test_trace_wiring.py — Wiring tests for Phase 6 (Tasks 6.1, 6.2, 6.3).
+
+Tests that verify the integration plumbing — gitignore entry, companion doc,
+and SKILL.md pointer — read the files on disk, not in-memory copies. The
+companion doc and SKILL.md pointer are shipped, so they are read from the
+framework root this file ships in (a plugin install has no git checkout); the
+.gitignore entry is the dev repo's own and is checked there only.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import subprocess
+from pathlib import Path
+
+import pytest
+
+import skill_text
+
+
+# ---------------------------------------------------------------------------
+# Helper: the framework root
+# ---------------------------------------------------------------------------
+
+_FRAMEWORK_ROOT = Path(__file__).resolve().parents[2]
+_needs_dev_gitignore = pytest.mark.skipif(
+    not (_FRAMEWORK_ROOT / ".gitignore").is_file(),
+    reason="asserts on the dev repo's own .gitignore (dev-repo only)")
+
+
+def _repo_root() -> Path:
+    """The framework root this file ships in (works from any worktree, and from a
+    plugin install, which is not a git checkout; consumer-repo-parity L4)."""
+    return _FRAMEWORK_ROOT
+
+
+# ---------------------------------------------------------------------------
+# Task 6.1: .trace/ gitignore entry
+# ---------------------------------------------------------------------------
+
+
+class TestTraceGitignored:
+    """Task 6.1 — .gitignore contains the trace dir pattern."""
+
+    @_needs_dev_gitignore
+    def test_trace_dir_gitignored(self):
+        """The .gitignore line 'three-pillars-docs/tp-designs/*/.trace/' must exist."""
+        root = _repo_root()
+        gitignore_path = root / ".gitignore"
+        assert gitignore_path.exists(), ".gitignore not found at repo root"
+
+        lines = gitignore_path.read_text(encoding="utf-8").splitlines()
+        expected = "three-pillars-docs/tp-designs/*/.trace/"
+        assert expected in lines, (
+            f"{expected!r} not found in .gitignore; "
+            f"run: echo '{expected}' >> .gitignore"
+        )
+
+    def test_sample_trace_path_matches_gitignore_pattern(self):
+        """A sample .trace/<run-id>/ path is covered by the gitignore glob."""
+        # The gitignore line uses a wildcard for the design slug; verify the
+        # pattern semantics match a representative path using fnmatch.
+        pattern = "three-pillars-docs/tp-designs/*/.trace/"
+        sample_path = "three-pillars-docs/tp-designs/my-design/.trace/"
+        assert fnmatch.fnmatch(sample_path, pattern), (
+            f"fnmatch({sample_path!r}, {pattern!r}) is False — pattern mismatch"
+        )
+
+    @_needs_dev_gitignore
+    def test_git_check_ignore_flags_trace_path(self):
+        """git check-ignore confirms a sample .trace/ path is ignored."""
+        root = _repo_root()
+        # Use a path relative to repo root
+        sample = "three-pillars-docs/tp-designs/my-design/.trace/01J9ABCDEF123456789ABCDEFG/"
+        result = subprocess.run(
+            ["git", "check-ignore", "-v", sample],
+            capture_output=True,
+            text=True,
+            cwd=str(root),
+        )
+        # exit 0 means the path is ignored; non-zero means it's not
+        assert result.returncode == 0, (
+            f"git check-ignore returned {result.returncode} for {sample!r}; "
+            f"stderr: {result.stderr!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 6.2: Companion doc coherence
+# ---------------------------------------------------------------------------
+
+_COMPANION_REQUIRED_SECTIONS = [
+    # (section-id, at-least-one-of these substrings must appear)
+    "record hook site",
+    "replay re-drive",
+    "cache-miss",
+    "canary",
+]
+
+
+class TestCompanionDocCoherence:
+    """Task 6.2 — record-replay.md exists, ≤500 lines, covers 4 required sections."""
+
+    def _companion_path(self) -> Path:
+        root = _repo_root()
+        return root / "skills" / "tp-run-full-design" / "record-replay.md"
+
+    def test_companion_doc_exists(self):
+        path = self._companion_path()
+        assert path.exists(), (
+            f"record-replay.md not found at {path}; Task 6.2 not yet implemented"
+        )
+
+    def test_companion_doc_line_count(self):
+        """record-replay.md must not exceed 500 lines (hard cap, no grandfather)."""
+        path = self._companion_path()
+        if not path.exists():
+            pytest.skip("record-replay.md not yet created")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert len(lines) <= 500, (
+            f"record-replay.md has {len(lines)} lines — exceeds 500-line hard cap"
+        )
+
+    def test_companion_doc_coherence(self):
+        """record-replay.md covers all 4 required sections (case-insensitive grep)."""
+        path = self._companion_path()
+        if not path.exists():
+            pytest.skip("record-replay.md not yet created")
+        text = path.read_text(encoding="utf-8").lower()
+        missing = []
+        for section in _COMPANION_REQUIRED_SECTIONS:
+            if section.lower() not in text:
+                missing.append(section)
+        assert not missing, (
+            f"record-replay.md is missing required sections: {missing!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 6.3: SKILL.md pointer line
+# ---------------------------------------------------------------------------
+
+
+class TestSkillPointer:
+    """Task 6.3 — SKILL.md has exactly one pointer to record-replay.md, ≤1088 lines."""
+
+    def _skill_path(self) -> Path:
+        root = _repo_root()
+        return root / "skills" / "tp-run-full-design" / "SKILL.md"
+
+    def _skill_lines(self) -> list[str]:
+        return skill_text.read_skill_text("tp-run-full-design").splitlines()
+
+    def test_skill_pointer(self):
+        """SKILL.md has exactly one reference to record-replay.md AND ≤1089 lines."""
+        path = self._skill_path()
+        assert path.exists(), f"SKILL.md not found at {path}"
+        lines = self._skill_lines()
+
+        # Absolute line-count cap (1079 grandfathered + 2 pointer lines + 1
+        # --mode argument + 2 worktree-agent-branch-cleanup exit-hook lines
+        # + 4 shared-script-path-resolution lines: the Tier-6 github_pr_author.py
+        # call site now resolves git-toplevel-first via resolve_script.py
+        # + 1 resolve-script-override-roots line: that call site's resolved path
+        # is now guarded with a separate `[ -n "$GHPA" ] || exit 1`, because a
+        # command substitution swallows the resolver's fail-loud exit 1)
+        assert len(lines) <= 1089, (
+            f"SKILL.md has {len(lines)} lines — exceeds 1089-line cap "
+            f"(grandfathered at 1079 + 2 pointer lines + 1 --mode argument "
+            f"+ 2 exit-hook lines + 4 shared-script-path-resolution lines "
+            f"+ 1 override-roots guard line)"
+        )
+
+        # Exactly one pointer to record-replay.md
+        pointer_lines = [ln for ln in lines if "record-replay.md" in ln]
+        assert len(pointer_lines) == 1, (
+            f"Expected exactly 1 line in SKILL.md referencing record-replay.md, "
+            f"found {len(pointer_lines)}: {pointer_lines!r}"
+        )
+
+    def test_skill_pointer_near_return_clipping(self):
+        """The record-replay.md pointer lives near the ## Return clipping section."""
+        path = self._skill_path()
+        if not path.exists():
+            pytest.skip("SKILL.md not found")
+        lines = self._skill_lines()
+
+        # Find the '## Return clipping' heading (must start with '##')
+        clipping_idx = next(
+            (i for i, ln in enumerate(lines) if ln.strip().startswith("## Return clipping")),
+            None,
+        )
+        pointer_idx = next(
+            (i for i, ln in enumerate(lines) if "record-replay.md" in ln),
+            None,
+        )
+        if clipping_idx is None or pointer_idx is None:
+            pytest.skip("Cannot locate anchors in SKILL.md")
+
+        # Pointer should appear within 20 lines of ## Return clipping
+        distance = abs(pointer_idx - clipping_idx)
+        assert distance <= 20, (
+            f"record-replay.md pointer is {distance} lines from ## Return clipping "
+            f"(expected within 20 lines)"
+        )
